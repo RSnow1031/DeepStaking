@@ -1,4 +1,5 @@
-pragma solidity 0.8.4;
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.4;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
@@ -26,10 +27,10 @@ contract DKeeperStake is Ownable, IERC721Receiver {
     IDKeeperEscrow public dKeeperEscrow;
 
     // Timestamp of last reward
-    uint256 public lastRewardTime;
+    mapping(address => uint256) private _lastRewardTime;
 
     // Accumulated token per share
-    uint256 public accTokenPerShare;
+    mapping(address => uint256) private _accTokenPerShare;
 
     // Staked users' NFT Id existing check
     mapping(address => mapping(uint256 => uint256)) public userNFTs;
@@ -77,8 +78,8 @@ contract DKeeperStake is Ownable, IERC721Receiver {
     function pendingDeep(address _user) external view returns (uint256) {
         UserInfo memory user = userInfo[_user];
 
-        uint256 updatedAccTokenPerShare = accTokenPerShare;
-        if (block.timestamp > lastRewardTime && totalAllocPoint != 0) {
+        uint256 updatedAccTokenPerShare = _accTokenPerShare[msg.sender];
+        if (block.timestamp > _lastRewardTime[msg.sender] && totalAllocPoint != 0) {
             uint256 rewards = getRewards(lastRewardTime, block.timestamp);
             updatedAccTokenPerShare += ((rewards * 1e12) / totalAllocPoint);
         }
@@ -87,62 +88,45 @@ contract DKeeperStake is Ownable, IERC721Receiver {
     }
 
     // Update reward variables to be up-to-date.
-    function updatePool() public {
+    function updatePool() public returns(bool) {
+	    uint256 lastRewardTime = _lastRewardTime[msg.sender];
         if (block.timestamp <= lastRewardTime || lastRewardTime >= endTime) {
-            return;
+            return false;
         }
         if (totalAllocPoint == 0) {
-            lastRewardTime = block.timestamp;
-            return;
+            _lastRewardTime[msg.sender] = block.timestamp;
+            return false;
         }
 
         uint256 rewards = getRewards(lastRewardTime, block.timestamp);
 
-        accTokenPerShare = accTokenPerShare + ((rewards * 1e12) / totalAllocPoint);
-        lastRewardTime = block.timestamp;
+        _accTokenPerShare[msg.sender] = _accTokenPerShare[msg.sender] + ((rewards * 1e12) / totalAllocPoint);
+        _lastRewardTime[msg.sender] = block.timestamp;
+	    return true;
     }
 
     // Deposit NFT to NFTStaking for DEEP allocation.
     function deposit(uint256 _tokenId) public {
         require(dKeeper.ownerOf(_tokenId) == msg.sender, "Invalid NFT owner");
         UserInfo storage user = userInfo[msg.sender];
-        updatePool();
-
-        if (user.amount != 0) {
-            uint256 pending = (user.amount * accTokenPerShare) / 1e12 - user.rewardDebt;
-            if (pending > 0) {
-                safeDeepTransfer(msg.sender, pending);
-                user.lastClaimTime = block.timestamp;
-                emit Claimed(msg.sender, pending);
-            }
-        }
-
         dKeeper.safeTransferFrom(address(msg.sender), address(this), _tokenId);
         user.amount = user.amount + dKeeper.mintedPrice(_tokenId);
         user.lastStakeTime = block.timestamp;
         totalAllocPoint += dKeeper.mintedPrice(_tokenId);
         userNFTs[msg.sender][_tokenId] = stakedNFTs[msg.sender].length + 1;
         stakedNFTs[msg.sender].push(_tokenId);
-
-        user.rewardDebt = (user.amount * accTokenPerShare) / 1e12;
+	    updatePool();
+        user.rewardDebt = (user.amount * _accTokenPerShare[msg.sender]) / 1e12;
+	    userInfo[msg.sender] = user;
         emit Deposited(msg.sender, _tokenId, dKeeper.mintedPrice(_tokenId));
     }
-
     // Withdraw NFT token.
     function withdraw(uint256 _tokenId) public {
         require(userNFTs[msg.sender][_tokenId] != 0, "Invalid NFT owner");
+	    claim();
         UserInfo storage user = userInfo[msg.sender];
-
-        updatePool();
-        uint256 pending = (user.amount * accTokenPerShare) / 1e12 - user.rewardDebt;
-        if (pending > 0) {
-            safeDeepTransfer(msg.sender, pending);
-            user.lastClaimTime = block.timestamp;
-            emit Claimed(msg.sender, pending);
-        }
-
         user.amount = user.amount - dKeeper.mintedPrice(_tokenId);
-        dKeeper.safeTransferFrom(address(this), address(msg.sender), _tokenId);
+        dKeeper.safeTransfer(address(msg.sender), _tokenId);
         totalAllocPoint -= dKeeper.mintedPrice(_tokenId);
 
         // remove tokens from userInfo tokens array
@@ -150,10 +134,9 @@ contract DKeeperStake is Ownable, IERC721Receiver {
             stakedNFTs[msg.sender].length - 1
         ];
         stakedNFTs[msg.sender].pop();
-
         userNFTs[msg.sender][_tokenId] = 0;
-
-        user.rewardDebt = (user.amount * accTokenPerShare) / 1e12;
+	    user.rewardDebt = (user.amount * _accTokenPerShare[msg.sender]) / 1e12;
+	    userInfo[msg.sender] = user;
         emit Withdrawn(msg.sender, _tokenId, dKeeper.mintedPrice(_tokenId));
     }
 
@@ -163,23 +146,24 @@ contract DKeeperStake is Ownable, IERC721Receiver {
         require(user.amount != 0, "Not deposited NFTs.");
         updatePool();
 
-        uint256 pending = (user.amount * accTokenPerShare) / 1e12 - user.rewardDebt;
+        uint256 pending = (user.amount * _accTokenPerShare[msg.sender]) / 1e12 - user.rewardDebt;
         if (pending > 0) {
-            safeDeepTransfer(msg.sender, pending);
+            _safeDeepTransfer(msg.sender, pending);
             user.lastClaimTime = block.timestamp;
             emit Claimed(msg.sender, pending);
         }
 
-        user.rewardDebt = (user.amount * accTokenPerShare) / 1e12;
+        user.rewardDebt = (user.amount * _accTokenPerShare[msg.sender]) / 1e12;
+	    userInfo[msg.sender] = user;
     }
 
     // Safe DEEP transfer function, just in case if rounding error causes pool to not have enough DEEP
-    function safeDeepTransfer(address _to, uint256 _amount) internal {
+    function _safeDeepTransfer(address _to, uint256 _amount) internal {
         dKeeperEscrow.mint(_to, _amount);
     }
 
     // Get rewards between block timestamps
-    function getRewards(uint256 _from, uint256 _to) internal view returns (uint256 rewards) {
+    function getRewards(uint256 _from, uint256 _to) external view returns (uint256 rewards) {
         while (_from + WEEK <= _to) {
             rewards += getRewardRatio(_from) * WEEK;
             _from = _from + WEEK;
@@ -191,7 +175,7 @@ contract DKeeperStake is Ownable, IERC721Receiver {
     }
 
     // Get rewardRatio from timestamp
-    function getRewardRatio(uint256 _time) internal view returns (uint256) {
+    function getRewardRatio(uint256 _time) external view returns (uint256) {
         if (52 < (_time - startTime) / WEEK) return 0;
 
         return (((1e25 * (52 - (_time - startTime) / WEEK)) / 52 / 265) * 10) / WEEK;
